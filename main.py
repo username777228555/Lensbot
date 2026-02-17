@@ -2,6 +2,7 @@ import os
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -10,8 +11,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from google import genai
-from google.genai import types
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -20,9 +19,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com",
+)
 
 SYSTEM_PROMPT = """Ты — эксперт по фотографии, фотоаппаратам, объективам и оптическим системам.
 
@@ -35,7 +37,7 @@ SYSTEM_PROMPT = """Ты — эксперт по фотографии, фотоа
 - Отвечай на том языке, на котором задан вопрос
 """
 
-# История диалогов: user_id -> list of Content
+# История диалогов: user_id -> list of messages
 user_histories: dict[int, list] = {}
 
 
@@ -45,7 +47,6 @@ def get_history(user_id: int) -> list:
     return user_histories[user_id]
 
 
-# Простой HTTP-сервер для health check Koyeb
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -53,7 +54,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        pass  # Заглушить логи health check
+        pass
 
 
 def start_health_server():
@@ -87,40 +88,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         history = get_history(user_id)
+        history.append({"role": "user", "content": user_text})
 
-        history.append(
-            types.Content(role="user", parts=[types.Part(text=user_text)])
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            max_tokens=500,
+            temperature=0.7,
         )
 
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=history,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
-                max_output_tokens=500,
-                temperature=0.7,
-            ),
-        )
-
-        answer = response.text.strip()
-
-        history.append(
-            types.Content(role="model", parts=[types.Part(text=answer)])
-        )
+        answer = response.choices[0].message.content.strip()
+        history.append({"role": "assistant", "content": answer})
 
         # Ограничиваем историю последними 20 сообщениями
         if len(history) > 20:
             user_histories[user_id] = history[-20:]
 
     except Exception as e:
-        logger.error(f"Gemini error: {e}")
+        logger.error(f"DeepSeek error: {e}")
         answer = f"Ошибка: {e}"
 
     await update.message.reply_text(answer)
 
 
 def main() -> None:
-    # Запускаем health check сервер в фоне
     t = threading.Thread(target=start_health_server, daemon=True)
     t.start()
 
@@ -135,3 +128,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
