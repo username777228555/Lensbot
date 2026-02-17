@@ -1,9 +1,12 @@
 import os
 import logging
 import threading
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import deque
 from openai import OpenAI
+import httpx
+from bs4 import BeautifulSoup
 from telegram import Update, Message
 from telegram.ext import (
     Application,
@@ -27,44 +30,27 @@ client = OpenAI(
     base_url="https://api.deepseek.com",
 )
 
-SYSTEM_PROMPT = """Ты эксперт по фотографии, объективам, камерам и оптике.
+SYSTEM_PROMPT = """Ты опытный фотограф и знаток оптики, общаешься в фото-чате как свой среди своих.
 
-Стиль:
-- Пиши как человек, коротко и по делу
-- Максимум 3-4 предложения, если не просят подробнее
-- Никакого форматирования: никаких **, *, #, _, никаких списков — только обычный текст
-- Если не знаешь точно — так и скажи, не выдумывай
-- Если вопрос не по теме фото/оптики — вежливо откажи
+Стиль общения:
+- Пиши как живой человек из фотосообщества, не как справочник
+- Коротко, 2-4 предложения максимум
+- Используй сленг: ФФ (полный кадр), кроп (APS-C), Микра (Micro 4/3), гелик (Гелиос), сапог/кэнон (Canon), никон, сонька (Sony), фуджик (Fujifilm), сф (среднеформатная), стекло (объектив), светлое стекло, мыльница, беззер, зеркалка, боке, ГРИП, кит, телевик, ширик, макро, портретник, фикс, зум
+- Никакого форматирования: без **, *, #, _, без списков — только обычный текст
+- Если не знаешь — скажи честно
+- Если вопрос не по теме фото/оптики — вежливо скажи об этом
 - Отвечай на языке собеседника
 """
 
-# Очень строгий промпт для проверки ошибок.
-# Срабатывает ТОЛЬКО на бесспорные технические ошибки.
-MISTAKE_PROMPT = """Ты эксперт по фотографии, объективам и оптике.
+MISTAKE_PROMPT = """Ты опытный фотограф и знаток оптики. Читаешь сообщение из фото-чата.
 
-Тебе дают сообщение из чата. Оцени: содержит ли оно ОЧЕВИДНУЮ и БЕССПОРНУЮ фактическую ошибку по теме фотографии или оптики?
+Есть ли в сообщении фактическая ошибка по теме фотографии, объективов или оптики?
 
-Критерии для вмешательства (должны выполняться ВСЕ):
-1. Ошибка касается фото, объективов, камер или оптики
-2. Ошибка фактическая и однозначная — не спорная, не вопрос вкуса, не мнение
-3. Ты уверен на 100% — это противоречит физике или общеизвестным техническим фактам
-4. Сообщение — утверждение, а не вопрос
+Вмешайся если человек путает технические факты: кроп-факторы, принцип работы диафрагмы/ISO/выдержки, физику оптики, байонеты, совместимость объективов, характеристики конкретных моделей.
+Не вмешивайся если это мнение, вопрос, или сообщение не про фото/оптику, или ты не уверен.
 
-Примеры когда надо вмешаться:
-- "полный кадр имеет кроп-фактор 2" (неверно, это у MFT)
-- "диафрагма f/1.4 пропускает меньше света чем f/8" (неверно)
-- "ISO не влияет на шум" (неверно)
-
-Примеры когда НЕ надо вмешаться:
-- мнения и предпочтения ("Sony лучше Canon")
-- спорные утверждения
-- сообщения не по теме фото/оптики
-- вопросы
-- всё что вызывает хоть малейшие сомнения
-
-Если ошибки нет или ты не уверен на 100% — ответь одним словом: SKIP
-
-Если ошибка есть — поправь коротко и вежливо, 1-2 предложения, без форматирования.
+Если ошибки нет — ответь: SKIP
+Если ошибка есть — поправь коротко и по-дружески, 1-2 предложения, без форматирования.
 """
 
 private_histories: dict[int, deque] = {}
@@ -73,6 +59,65 @@ group_histories: dict[int, deque] = {}
 MAX_HISTORY = 30
 MAX_TOKENS = 350
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
+
+
+# ─── lens-club.ru через DuckDuckGo ───────────────────────────────────────────
+
+def search_lens_club(query: str) -> str | None:
+    """
+    Ищет по lens-club.ru через DuckDuckGo HTML (не требует API-ключей).
+    Возвращает текст со сниппетами найденных страниц.
+    """
+    try:
+        ddg_url = "https://html.duckduckgo.com/html/"
+        params = {"q": f"site:lens-club.ru {query}", "kl": "ru-ru"}
+
+        r = httpx.post(ddg_url, data=params, headers=HEADERS, timeout=10, follow_redirects=True)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        results = []
+        for result in soup.select(".result")[:4]:
+            title_el = result.select_one(".result__title")
+            snippet_el = result.select_one(".result__snippet")
+            url_el = result.select_one(".result__url")
+
+            title = title_el.get_text(strip=True) if title_el else ""
+            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
+            url = url_el.get_text(strip=True) if url_el else ""
+
+            if title or snippet:
+                results.append(f"{title}\n{snippet}\n{url}".strip())
+
+        if not results:
+            return None
+
+        return "\n\n".join(results)
+
+    except Exception as e:
+        logger.warning(f"lens-club search error: {e}")
+        return None
+
+
+def should_search_lens_club(text: str) -> bool:
+    """Определяет, стоит ли искать на lens-club — вопрос про конкретный объектив."""
+    keywords = [
+        "объектив", "стекло", "линза", r"\d+mm", r"\d+мм", r"f/\d", r"f\d\.",
+        "canon", "nikon", "sony", "sigma", "tamron", "zeiss", "цейсс", "voigtlander",
+        "гелиос", "гелик", "юпитер", "индустар", "мир-", "зенитар", "ломо",
+        "характеристики", "резкость", "боке", "автофокус", "светосил",
+        "что скажешь", "как стекло", "стоит брать", "посоветуй", "обзор",
+        "мтф", "mtf", "кроп-фактор", "байонет",
+    ]
+    text_lower = text.lower()
+    return any(re.search(kw, text_lower) for kw in keywords)
+
+
+# ─── История ─────────────────────────────────────────────────────────────────
 
 def get_private_history(user_id: int) -> deque:
     if user_id not in private_histories:
@@ -84,16 +129,6 @@ def get_group_history(chat_id: int) -> deque:
     if chat_id not in group_histories:
         group_histories[chat_id] = deque(maxlen=MAX_HISTORY)
     return group_histories[chat_id]
-
-
-def ask_deepseek(messages: list, max_tokens: int = MAX_TOKENS) -> str:
-    response = client.chat.completions.create(
-        model="deepseek-chat",
-        messages=messages,
-        max_tokens=max_tokens,
-        temperature=0.3,  # Ниже температура = меньше галлюцинаций
-    )
-    return response.choices[0].message.content.strip()
 
 
 def is_mentioned(message: Message, bot_username: str) -> bool:
@@ -114,6 +149,8 @@ def is_reply_to_bot(message: Message, bot_id: int) -> bool:
     )
 
 
+# ─── Health check ─────────────────────────────────────────────────────────────
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -131,9 +168,35 @@ def start_health_server():
     server.serve_forever()
 
 
+# ─── Построение сообщений с данными с lens-club ───────────────────────────────
+
+def build_messages(system: str, history: list, user_text: str) -> list:
+    messages = [{"role": "system", "content": system}] + list(history)
+
+    if should_search_lens_club(user_text):
+        lens_data = search_lens_club(user_text)
+        if lens_data:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Вот что нашлось на lens-club.ru по этому вопросу:\n\n"
+                    f"{lens_data}\n\n"
+                    "Используй эти данные, но отвечай в своём обычном живом стиле."
+                )
+            })
+            logger.info("lens-club data injected")
+        else:
+            logger.info("lens-club: no results")
+
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+
+# ─── Handlers ─────────────────────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Привет! Спрашивай про объективы, камеры и оптику.\n/reset — сбросить историю диалога"
+        "Привет! Спрашивай про стёкла, камеры и всё такое.\n/reset — сбросить историю"
     )
 
 
@@ -142,7 +205,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     private_histories.pop(user_id, None)
     group_histories.pop(chat_id, None)
-    await update.message.reply_text("История сброшена.")
+    await update.message.reply_text("Сброшено.")
 
 
 async def handle_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -152,16 +215,21 @@ async def handle_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     history = get_private_history(user_id)
-    history.append({"role": "user", "content": user_text})
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + list(history)
+    messages = build_messages(SYSTEM_PROMPT, list(history), user_text)
 
     try:
-        answer = ask_deepseek(messages)
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=messages,
+            max_tokens=MAX_TOKENS,
+            temperature=0.8,
+        )
+        answer = response.choices[0].message.content.strip()
+        history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": answer})
     except Exception as e:
         logger.error(f"DeepSeek error: {e}")
-        answer = "Ошибка запроса к AI, попробуй ещё раз."
+        answer = "Что-то сломалось, попробуй ещё раз."
 
     await update.message.reply_text(answer)
 
@@ -172,7 +240,7 @@ async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     chat_id = message.chat_id
-    user_name = message.from_user.first_name or "Пользователь"
+    user_name = message.from_user.first_name or "Кто-то"
     user_text = message.text
     bot_username = context.bot.username
     bot_id = context.bot.id
@@ -189,43 +257,43 @@ async def handle_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context_text = "\n".join(
             f"{m['name']}: {m['text']}" for m in list(history)[-15:]
         )
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"Переписка в чате:\n{context_text}\n\nОтветь на последнее обращение к тебе.",
-            },
-        ]
-
-        try:
-            answer = ask_deepseek(messages)
-        except Exception as e:
-            logger.error(f"DeepSeek error: {e}")
-            answer = "Ошибка запроса, попробуй ещё раз."
-
-        await message.reply_text(answer)
-
-    else:
-        # Проверка на ошибку — temperature=0 для максимальной строгости
-        messages = [
-            {"role": "system", "content": MISTAKE_PROMPT},
-            {"role": "user", "content": user_text},
-        ]
+        full_query = f"Переписка в чате:\n{context_text}\n\nОтветь на последнее обращение к тебе."
+        messages = build_messages(SYSTEM_PROMPT, [], full_query)
 
         try:
             response = client.chat.completions.create(
                 model="deepseek-chat",
                 messages=messages,
-                max_tokens=120,
-                temperature=0,  # Ноль — только если модель уверена на 100%
+                max_tokens=MAX_TOKENS,
+                temperature=0.8,
             )
             answer = response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"DeepSeek error: {e}")
+            answer = "Что-то сломалось, попробуй ещё раз."
 
-            if answer.upper() != "SKIP" and not answer.upper().startswith("SKIP"):
+        await message.reply_text(answer)
+
+    else:
+        # Проверка на ошибку
+        try:
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": MISTAKE_PROMPT},
+                    {"role": "user", "content": user_text},
+                ],
+                max_tokens=120,
+                temperature=0.2,
+            )
+            answer = response.choices[0].message.content.strip()
+            if not answer.upper().startswith("SKIP"):
                 await message.reply_text(answer)
         except Exception as e:
             logger.error(f"DeepSeek mistake check error: {e}")
 
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     t = threading.Thread(target=start_health_server, daemon=True)
@@ -252,3 +320,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+        
